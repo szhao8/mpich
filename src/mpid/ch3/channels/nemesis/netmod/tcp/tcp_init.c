@@ -374,18 +374,24 @@ static int GetSockInterfaceAddr(int myRank, char *ifname, int maxIfname,
 
     /* If we don't have an IP address, try to get it from the name */
     if (!ifaddrFound) {
-        int i;
-	struct hostent *info = NULL;
+        int i, s = 0;
+        struct addrinfo hints;
+        struct addrinfo *result, *rp;
+        memset(&hints, 0, sizeof(struct addrinfo));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags = 0;
+        hints.ai_protocol = 0;
         for (i = 0; i < MPIR_CVAR_NEMESIS_TCP_HOST_LOOKUP_RETRIES; ++i) {
-            info = gethostbyname( ifname_string );
-            if (info || h_errno != TRY_AGAIN)
+            s = getaddrinfo(ifname_string, NULL, &hints, &result);
+            if (s != 0|| h_errno != TRY_AGAIN)
                 break;
         }
-        MPIR_ERR_CHKANDJUMP2(!info || !info->h_addr_list, mpi_errno, MPI_ERR_OTHER, "**gethostbyname", "**gethostbyname %s %d", ifname_string, h_errno);
+        MPIR_ERR_CHKANDJUMP2(s, mpi_errno, MPI_ERR_OTHER, "**gethostbyname", "**gethostbyname %s %d", ifname_string, h_errno);
         
         /* Use the primary address */
-        ifaddr->len  = info->h_length;
-        ifaddr->type = info->h_addrtype;
+        ifaddr->len  = result->ai_addrlen;
+        ifaddr->type = result->ai_socktype;
         if (ifaddr->len > sizeof(ifaddr->ifaddr)) {
             /* If the address won't fit in the field, reset to
                no address */
@@ -393,8 +399,9 @@ static int GetSockInterfaceAddr(int myRank, char *ifname, int maxIfname,
             ifaddr->type = -1;
             MPIR_ERR_INTERNAL(mpi_errno, "Address too long to fit in field");
         } else {
-            MPIR_Memcpy( ifaddr->ifaddr, info->h_addr_list[0], ifaddr->len );
+            MPIR_Memcpy( ifaddr->ifaddr, result->ai_addr, ifaddr->len );
 	}
+	freeaddrinfo(result);
     }
 
 fn_exit:

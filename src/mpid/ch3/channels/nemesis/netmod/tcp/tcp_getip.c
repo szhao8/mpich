@@ -67,6 +67,7 @@ int MPIDI_GetIPInterface( MPIDI_CH3I_nem_tcp_ifaddr_t *ifaddr, int *found )
     MPIDI_CH3I_nem_tcp_ifaddr_t myifaddr;
     int nfound = 0, foundLocalhost = 0;
     /* We predefine the LSB and MSB localhost addresses */
+    unsigned char localhost6[16] = "::1";
     unsigned int localhost = 0x0100007f;
 #ifdef WORDS_BIGENDIAN
     unsigned int MSBlocalhost = 0x7f000001;
@@ -145,14 +146,39 @@ int MPIDI_GetIPInterface( MPIDI_CH3I_nem_tcp_ifaddr_t *ifaddr, int *found )
 	if (dbg_ifname) {
 	    fprintf( stdout, "%10s\t", ifreq->ifr_name );
 	}
-	
-	if (ifreq->ifr_addr.sa_family == AF_INET) {
+        if (ifreq->ifr_addr.sa_family == AF_INET6) {
+            struct in6_addr     addr;
+            addr = ((struct sockaddr_in6 *) &(ifreq->ifr_addr))->sin6_addr;
+            if (dbg_ifname) {
+                char straddr[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, &addr, straddr, sizeof(straddr));
+                fprintf(stdout, "IPV6 address = %s (%s)\n", addr.s6_addr,
+                    straddr);
+            }
+            if (memcmp(addr.s6_addr,localhost6, 16) == 0) {
+                foundLocalhost = 1;
+                if (nfound == 0) {
+                    myifaddr.type = AF_INET6;
+                    myifaddr.len  = 16;
+                    MPIR_Memcpy( myifaddr.ifaddr, &addr.s6_addr, 16);
+                }
+            }
+            else {
+                nfound++;
+                myifaddr.type = AF_INET6;
+                myifaddr.len  = 16;
+                MPIR_Memcpy( myifaddr.ifaddr, &addr.s6_addr, 16);
+            }
+        }
+	else if (ifreq->ifr_addr.sa_family == AF_INET) {
 	    struct in_addr		addr;
 
 	    addr = ((struct sockaddr_in *) &(ifreq->ifr_addr))->sin_addr;
 	    if (dbg_ifname) {
+                char straddr[INET_ADDRSTRLEN];
+		inet_ntop(AF_INET, &addr, straddr, sizeof(straddr));
 		fprintf( stdout, "IPv4 address = %08x (%s)\n", addr.s_addr, 
-			 inet_ntoa( addr ) );
+			 straddr );
 	    }
 
 	    if (addr.s_addr == localhost && dbg_ifname) {

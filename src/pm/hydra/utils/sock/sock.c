@@ -21,6 +21,9 @@ struct fwd_hash {
 HYD_status HYDU_sock_listen(int *listen_fd, char *port_range, uint16_t * port)
 {
     struct sockaddr_in sa;
+    struct sockaddr_in6 sa6;
+    struct sockaddr_storage sa_storage;
+    socklen_t addrlen;
     int one = 1;
     uint16_t low_port, high_port;
     char *port_str;
@@ -62,7 +65,6 @@ HYD_status HYDU_sock_listen(int *listen_fd, char *port_range, uint16_t * port)
 
     if (setsockopt(*listen_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(int)) < 0)
         HYDU_ERR_SETANDJUMP(status, HYD_SOCK_ERROR, "cannot set TCP_NODELAY\n");
-
     /* The sockets standard does not guarantee that a successful
      * return here means that this is set. However, REUSEADDR not
      * being set is not a fatal error, so we ignore that
@@ -70,14 +72,15 @@ HYD_status HYDU_sock_listen(int *listen_fd, char *port_range, uint16_t * port)
      * something bad has happened. */
     if (setsockopt(*listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int)) < 0)
         HYDU_ERR_SETANDJUMP(status, HYD_SOCK_ERROR, "cannot set SO_REUSEADDR\n");
-
     for (i = low_port; i <= high_port; i++) {
         memset((void *) &sa, 0, sizeof(struct sockaddr_in));
-        sa.sin_family = AF_INET;
+        memset(&sa_storage, 0, sizeof(struct sockaddr_storage));
+	sa.sin_family = AF_INET;
         sa.sin_port = htons(i);
         sa.sin_addr.s_addr = INADDR_ANY;
-
-        if (bind(*listen_fd, (struct sockaddr *) &sa, sizeof(struct sockaddr_in)) < 0) {
+        memcpy(&sa_storage, &sa, sizeof(sa));
+        addrlen = sizeof(sa);
+        if (bind(*listen_fd, (struct sockaddr *) &sa_storage, addrlen) < 0) {
             /* If the address is in use, we should try the next
              * port. Otherwise, it's an error. */
             if (errno != EADDRINUSE)
@@ -104,12 +107,12 @@ HYD_status HYDU_sock_listen(int *listen_fd, char *port_range, uint16_t * port)
     /* We asked for any port, so we need to find out which port we
      * actually got. */
     if (*port == 0) {
-        socklen_t sinlen = sizeof(struct sockaddr_in);
+        socklen_t sinlen = sizeof(struct sockaddr_storage);
 
-        if (getsockname(*listen_fd, (struct sockaddr *) &sa, &sinlen) < 0)
+        if (getsockname(*listen_fd, (struct sockaddr *) &sa_storage, &sinlen) < 0)
             HYDU_ERR_SETANDJUMP(status, HYD_SOCK_ERROR, "getsockname error (%s)\n",
                                 MPL_strerror(errno));
-        *port = ntohs(sa.sin_port);
+        *port = ntohs(((struct sockaddr_in *) &sa_storage)->sin_port);
     }
 
   fn_exit:
@@ -124,48 +127,52 @@ HYD_status HYDU_sock_listen(int *listen_fd, char *port_range, uint16_t * port)
 HYD_status HYDU_sock_connect(const char *host, uint16_t port, int *fd, int retries,
                              unsigned long delay)
 {
-    struct hostent *ht;
-    struct sockaddr_in sa;
-    int one = 1, ret, retry_count;
+    struct addrinfo hints;
+    struct addrinfo *result, *rp;
+    char port_num[16];
+    int one = 1, ret, retry_count, status_code = 0;
     HYD_status status = HYD_SUCCESS;
 
     HYDU_FUNC_ENTER();
 
-    memset((char *) &sa, 0, sizeof(struct sockaddr_in));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = 0;
+    hints.ai_protocol = 0;
+    snprintf(port_num, 16, "%d", port);
     /* Get the remote host's IP address. Note that this is not
      * thread-safe. Since we don't use threads right now, we don't
      * worry about locking it. */
-    ht = gethostbyname(host);
-    if (ht == NULL)
+    status_code = getaddrinfo(host, port_num, &hints, &result);
+    if (status_code != 0)
         HYDU_ERR_SETANDJUMP(status, HYD_INVALID_PARAM,
                             "unable to get host address for %s (%s)\n", host, HYDU_herror(h_errno));
-    memcpy(&sa.sin_addr, ht->h_addr_list[0], ht->h_length);
-
-    /* Create a socket and set the required options */
-    *fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (*fd < 0)
-        HYDU_ERR_SETANDJUMP(status, HYD_SOCK_ERROR, "cannot open socket (%s)\n",
-                            MPL_strerror(errno));
-
+    for (rp = result; rp != NULL; rp = rp->ai_next) {
+        *fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (*fd < 0) {
+            if (rp->ai_next == NULL) HYDU_ERR_SETANDJUMP(status, HYD_SOCK_ERROR, "cannot open socket (%s)\n", MPL_strerror(errno));
+            continue;
+        }
     /* Not being able to connect is not an error in all cases. So we
      * return an error, but only print a warning message. The upper
      * layer can decide what to do with the return status. */
-    retry_count = 0;
-    do {
-        ret = connect(*fd, (struct sockaddr *) &sa, sizeof(struct sockaddr_in));
-        if (ret < 0 && (errno == ECONNREFUSED || errno == ETIMEDOUT)) {
+        retry_count = 0;
+        do {
+            ret = connect(*fd, rp->ai_addr, rp->ai_addrlen);
+            if (ret < 0 && (errno == ECONNREFUSED || errno == ETIMEDOUT)) {
             /* connection error; increase retry count and delay */
-            retry_count++;
-            if (retry_count > retries)
+                retry_count++;
+                if (retry_count > retries)
+                    break;
+                HYDU_delay(delay);
+            } else
                 break;
-            HYDU_delay(delay);
-        } else
-            break;
-    } while (1);
-
+        } while (1);
+        if (ret != -1) break;
+        close(*fd);
+    }
+    freeaddrinfo(result);
     if (ret < 0) {
         char localhost[MAX_HOSTNAME_LEN] = { 0 };
 
@@ -480,24 +487,29 @@ HYD_status HYDU_sock_get_iface_ip(char *iface, char **ip)
 #if defined(HAVE_GETIFADDRS)
     struct ifaddrs *ifaddr, *ifa;
     char buf[MAX_HOSTNAME_LEN];
-    struct sockaddr_in *sa;
+    struct sockaddr *sa;
 
     /* Got the interface name; let's query for the IP address */
     if (getifaddrs(&ifaddr) == -1)
         HYDU_ERR_SETANDJUMP(status, HYD_INTERNAL_ERROR, "getifaddrs failed\n");
 
     for (ifa = ifaddr; ifa; ifa = ifa->ifa_next)
-        if (!strcmp(ifa->ifa_name, iface) && (ifa->ifa_addr) &&
-            (ifa->ifa_addr->sa_family == AF_INET))
+        if (!strcmp(ifa->ifa_name, iface) && (ifa->ifa_addr))
             break;
 
     if (!ifa)
         HYDU_ERR_SETANDJUMP(status, HYD_INTERNAL_ERROR, "unable to find interface %s\n", iface);
 
-    sa = (struct sockaddr_in *) ifa->ifa_addr;
+    sa = ifa->ifa_addr;
 #if defined HAVE_INET_NTOP
-    (*ip) = MPL_strdup((char *)
-                       inet_ntop(AF_INET, (const void *) &(sa->sin_addr), buf, MAX_HOSTNAME_LEN));
+    if (ifa->ifa_addr->sa_family == AF_INET) {
+        (*ip) = MPL_strdup((char *)
+                       inet_ntop(AF_INET, (const void *) &(((struct sockaddr_in *)sa)->sin_addr), buf, MAX_HOSTNAME_LEN));
+    }
+    else if (ifa->ifa_addr->sa_family == AF_INET6) {
+        (*ip) = MPL_strdup((char *)
+                       inet_ntop(AF_INET6, (const void *) &(((struct sockaddr_in6 *)sa)->sin6_addr), buf, MAX_HOSTNAME_LEN));
+    }
 #else
     (*ip) = NULL;
 #endif /* HAVE_INET_NTOP */
@@ -525,16 +537,22 @@ HYD_status HYDU_sock_get_iface_ip(char *iface, char **ip)
 #if defined(HAVE_GETIFADDRS) && defined (HAVE_INET_NTOP)
 HYD_status HYDU_sock_is_local(char *host, int *is_local)
 {
-    struct hostent *ht;
+    struct addrinfo hints;
+    struct addrinfo *result, *rp;
     char *host_ip = NULL, *lhost_ip = NULL;
     char lhost[MAX_HOSTNAME_LEN];
     struct sockaddr_in sa;
     struct ifaddrs *ifaddr, *ifa;
     char buf[MAX_HOSTNAME_LEN];
+    int status_code = 0;
     HYD_status status = HYD_SUCCESS;
 
     *is_local = 0;
-
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = 0;
+    hints.ai_protocol = 0;
     /* Algorithm used:
      *
      * 1. Find the local host name
@@ -566,15 +584,24 @@ HYD_status HYDU_sock_is_local(char *host, int *is_local)
         /* If we are unable to resolve the remote host name, it need
          * not be an error. It could mean that the user is using an
          * alias for the hostname (e.g., an ssh config alias) */
-        if ((ht = gethostbyname(host)) == NULL)
+        if ((status_code = getaddrinfo(host, NULL, &hints, &result)) != 0)
             goto fn_exit;
-
-        memset((char *) &sa, 0, sizeof(struct sockaddr_in));
-        memcpy(&sa.sin_addr, ht->h_addr_list[0], ht->h_length);
-
+        char *tmp = NULL;
+        for (rp = result; rp != NULL; rp = rp->ai_next) {
+            if (rp->ai_family == AF_INET) {
+                tmp = (char *) inet_ntop(AF_INET, &(((struct sockaddr_in *)rp->ai_addr)->sin_addr), buf, MAX_HOSTNAME_LEN);
+                if (tmp == NULL) continue;
+            }
+            else {
+                tmp = (char *) inet_ntop(AF_INET6, &(((struct sockaddr_in6 *)rp->ai_addr)->sin6_addr), buf, MAX_HOSTNAME_LEN);
+                if (tmp == NULL) continue;
+            }
+            host_ip = MPL_strdup(tmp);
+            break;
+        }
         /* Find the IP address of the host */
-        host_ip = MPL_strdup((char *) inet_ntop(AF_INET, (const void *) &sa.sin_addr, buf,
-                                                MAX_HOSTNAME_LEN));
+        freeaddrinfo(result);
+        result = NULL;
         HYDU_ASSERT(host_ip, status);
     }
 
@@ -583,14 +610,23 @@ HYD_status HYDU_sock_is_local(char *host, int *is_local)
      * both.  */
 
     /* STEP 2: Let's try the gethostbyname model */
-
-    if ((ht = gethostbyname(lhost))) {
-        memset((char *) &sa, 0, sizeof(struct sockaddr_in));
-        memcpy(&sa.sin_addr, ht->h_addr_list[0], ht->h_length);
-
+    if ((status_code = getaddrinfo(lhost, NULL, &hints, &result)) == 0) {
+        char *tmp = NULL;
+        for (rp = result; rp != NULL; rp = rp->ai_next) {
+            if (rp->ai_family == AF_INET) {
+                tmp = (char *) inet_ntop(AF_INET, &(((struct sockaddr_in *)rp->ai_addr)->sin_addr), buf, MAX_HOSTNAME_LEN);
+                if (tmp == NULL) continue;
+            }
+            else {
+                tmp = (char *) inet_ntop(AF_INET6, &(((struct sockaddr_in6 *)rp->ai_addr)->sin6_addr), buf, MAX_HOSTNAME_LEN);
+                if (tmp == NULL) continue;
+            }
+            lhost_ip = MPL_strdup(tmp);
+            break;
+        }
         /* Find the IP address of the host */
-        lhost_ip = MPL_strdup((char *) inet_ntop(AF_INET, (const void *) &sa.sin_addr, buf,
-                                                 MAX_HOSTNAME_LEN));
+        freeaddrinfo(result);
+        result = NULL;
         HYDU_ASSERT(lhost_ip, status);
 
         /* See if the IP address of the hostname we got matches the IP
@@ -611,14 +647,19 @@ HYD_status HYDU_sock_is_local(char *host, int *is_local)
 
     /* Find the IP addresses of all local interfaces */
     for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-        if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
-            struct sockaddr_in *sa_ptr = (struct sockaddr_in *) ifa->ifa_addr;
-
-            lhost_ip = MPL_strdup((char *)
-                                  inet_ntop(AF_INET, (const void *) &(sa_ptr->sin_addr), buf,
-                                            MAX_HOSTNAME_LEN));
+        if (ifa->ifa_addr) {
+            if (ifa->ifa_addr->sa_family == AF_INET) {
+                struct sockaddr_in *sa_ptr = (struct sockaddr_in *) ifa->ifa_addr;
+                lhost_ip = MPL_strdup((char *)inet_ntop(AF_INET, (const void *) &(sa_ptr->sin_addr), buf, MAX_HOSTNAME_LEN));
+            }
+            else if (ifa->ifa_addr->sa_family == AF_INET6) {
+                struct sockaddr_in6 *sa6_ptr = (struct sockaddr_in6 *) ifa->ifa_addr;
+                lhost_ip = MPL_strdup((char *)inet_ntop(AF_INET6, (const void *) &(sa6_ptr->sin6_addr), buf, MAX_HOSTNAME_LEN));
+            }
+            else {
+                continue;
+            }
             HYDU_ASSERT(lhost_ip, status);
-
             /* For each local IP address, see if it matches the "host"
              * IP address */
             if (!strcmp(host_ip, lhost_ip)) {

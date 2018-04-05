@@ -1810,8 +1810,17 @@ int MPIDI_CH3I_Sock_post_connect(struct MPIDI_CH3I_Sock_set * sock_set, void * u
 {
     int mpi_errno = MPI_SUCCESS;
     MPIDI_CH3I_Sock_ifaddr_t ifaddr;
-    struct hostent * hostent;
-
+    struct addrinfo hints;
+    struct addrinfo *result, *rp;
+    int status_code = 0;
+    char port_str[16];
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = 0;
+    hints.ai_protocol = 0;
+    memset(port_str, 0, 16);
+    snprintf(port_str, 16, "%d", port);
     /*
      * Convert hostname to IP address
      *
@@ -1824,19 +1833,19 @@ int MPIDI_CH3I_Sock_post_connect(struct MPIDI_CH3I_Sock_set * sock_set, void * u
        routine? */
     strtok(host_description, " ");
     /* FIXME: For ipv6, we should use getaddrinfo */
-    hostent = gethostbyname(host_description);
+    status_code = getaddrinfo(host_description, port_str, &hints, &result);
     /* --BEGIN ERROR HANDLING-- */
-    if (hostent == NULL || hostent->h_addrtype != AF_INET) {
-	/* FIXME: Set error */
-	goto fn_exit;
+    if (status_code != 0) {
+        goto fn_exit;
     }
     /* --END ERROR HANDLING-- */
     /* These are correct for IPv4 */
-    memcpy( ifaddr.ifaddr, (unsigned char *)hostent->h_addr_list[0], 4 );
-    ifaddr.len  = 4;
-    ifaddr.type = AF_INET;
+    memcpy(ifaddr.ifaddr, result->ai_addr, sizeof(struct sockaddr));
+    ifaddr.len  = result->ai_addrlen;
+    ifaddr.type = result->ai_socktype;
     mpi_errno = MPIDI_CH3I_Sock_post_connect_ifaddr( sock_set, user_ptr,
 						&ifaddr, port, sockp );
+    freeaddrinfo(result);
  fn_exit:
     return mpi_errno;
 }

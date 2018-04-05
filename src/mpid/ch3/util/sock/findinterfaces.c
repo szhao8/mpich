@@ -14,23 +14,26 @@
 
 static int GetLocalIPs(int32_t *pIP, int max)
 {
-    char hostname[100], **hlist;
-    struct hostent *h = NULL;
-    int n = 0;
+    char hostname[100];
+    struct addrinfo hints;
+    struct addrinfo *result, *rp;
+    int n = 0, status = 0;
 
     MPID_Get_processor_name( hostname, sizeof(hostname), 0 );
 
-    h = gethostbyname(hostname);
-    if (h == NULL)
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = 0;
+    hints.ai_protocol = 0;
+    status = getaddrinfo(hostname, NULL, &hints, &result);
+    if (status != 0)
     {
-	return 0;
+        return 0;
     }
-    
-    hlist = h->h_addr_list;
-    while (*hlist != NULL && n<max)
+    for (rp = result; rp != NULL ; rp = rp->ai_next)
     {
-	pIP[n] = *(int32_t*)(*hlist);
-
+	pIP[n] = *(int32_t*)(rp->ai_addr);
 	/*{	
 	unsigned int a, b, c, d;
 	a = ((unsigned char *)(&pIP[n]))[0];
@@ -39,10 +42,9 @@ static int GetLocalIPs(int32_t *pIP, int max)
 	d = ((unsigned char *)(&pIP[n]))[3];
 	MPL_DBG_MSG_FMT(MPIDI_CH3_DBG_OTHER,TERSE,(MPL_DBG_FDEST,"ip: %u.%u.%u.%u\n", a, b, c, d));
 	}*/
-
-	hlist++;
 	n++;
     }
+    freeaddrinfo(result);
     return n;
 }
 
